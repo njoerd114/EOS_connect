@@ -587,3 +587,65 @@ def test_fixed_24h_array_quarter_hour(monkeypatch):
     expected = [round((10.0 + i // 4) / 100000, 9) for i in range(16)]
     actual = price_interface.get_current_prices()
     assert actual[:16] == pytest.approx(expected, rel=1e-9)
+
+
+def test_evcc_hourly(monkeypatch):
+    """Test EVCC /tariff/grid returns hourly prices (ct/kWh) and conversion to €/Wh."""
+    # Simulate hourly prices in ct/kWh
+    raw = [10.0 + i * 5.0 for i in range(48)]  # ct/kWh values
+
+    payload = {"prices": raw}
+
+    def fake_get(url, headers=None, timeout=None):
+        # Accept multiple endpoint variants
+        assert url.startswith("http://evcc:7070")
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("src.interfaces.price_interface.requests.get", fake_get)
+    monkeypatch.setattr(
+        PriceInterface, "_PriceInterface__start_update_service", lambda self: None
+    )
+
+    price_interface = PriceInterface(
+        {"source": "evcc", "token": "http://evcc:7070"},
+        time_frame_base=3600,
+        timezone=timezone.utc,
+    )
+
+    price_interface.update_prices(4, start_time=datetime(2025, 10, 20, 0, tzinfo=timezone.utc))
+
+    expected = [round(x / 100000, 9) for x in raw[:4]]
+    actual = price_interface.get_current_prices()
+    assert actual[:4] == pytest.approx(expected, rel=1e-9)
+
+
+def test_evcc_quarter_hour(monkeypatch):
+    """Test EVCC /tariff/grid returns hourly prices that are expanded to 15-min slots."""
+    raw = [12.0, 14.0, 16.0, 18.0]  # ct/kWh hourly for 4 hours
+    payload = {"prices": raw}
+
+    def fake_get(url, headers=None, timeout=None):
+        assert url.startswith("http://evcc:7070")
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("src.interfaces.price_interface.requests.get", fake_get)
+    monkeypatch.setattr(
+        PriceInterface, "_PriceInterface__start_update_service", lambda self: None
+    )
+
+    price_interface = PriceInterface(
+        {"source": "evcc", "token": "http://evcc:7070"},
+        time_frame_base=900,
+        timezone=timezone.utc,
+    )
+
+    price_interface.update_prices(4, start_time=datetime(2025, 10, 20, 0, tzinfo=timezone.utc))
+
+    # Each hourly value expanded to four 15-min entries and converted from ct/kWh
+    expected_hourly = [round(x / 100000, 9) for x in raw]
+    expected = []
+    for p in expected_hourly:
+        expected.extend([p] * 4)
+
+    actual = price_interface.get_current_prices()
+    assert actual[:16] == pytest.approx(expected, rel=1e-9)

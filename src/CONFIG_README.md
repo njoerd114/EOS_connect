@@ -121,7 +121,7 @@ A default config file will be created with the first start, if there is no `conf
 **Important: All price values must use the same base - either all prices include taxes and fees, or all prices exclude taxes and fees. Mixing different bases will lead to incorrect optimization results.**
 
 - **`price.source`**:  
-  Data source for electricity prices. Possible values: `tibber`, `smartenergy_at`, `stromligning`, `fixed_24h`, `default` (default uses akkudoktor API).
+  Data source for electricity prices. Possible values: `tibber`, `smartenergy_at`, `stromligning`, `fixed_24h`, `evcc`, `default` (default uses akkudoktor API).
 
 - **`price.token`**:  
   Token for accessing electricity price data. (If not needed, set to `token: ""`)
@@ -129,6 +129,21 @@ A default config file will be created with the first start, if there is no `conf
   When used with **Tibber**:
 
   Provide your token
+
+  When used with **EVCC** (new):
+
+  - EOS Connect can fetch prices from an EVCC instance using the `/tariff/grid` endpoint.
+  - You can provide the EVCC base URL in `price.token`, for example:
+
+    ```yaml
+    price:
+      source: evcc
+      token: "http://evcc:7070"
+    ```
+
+  - Alternatively, if `price.token` is not an URL, EOS Connect will look for the environment variable `EVCC_URL` and fall back to `http://evcc:7070`.
+  - If the EVCC instance requires authentication, set `price.token` to the bearer token (or `Bearer <token>`). When a non-URL token is provided, it is sent as `Authorization: Bearer <token>`.
+  - EVCC typically exposes prices hourly; EOS Connect will convert units to the internal €/Wh format and expand hourly values into 15-minute slots when `time_frame: 900` is configured.
 
   When used with **Strømligning**:
   - Use the format: `supplierId/productId[/customerGroupId]` (customer group is optional).  
