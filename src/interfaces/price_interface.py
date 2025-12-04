@@ -37,6 +37,7 @@ import json
 import logging
 import threading
 import requests
+import os
 
 
 logger = logging.getLogger("__main__")
@@ -410,6 +411,8 @@ class PriceInterface:
             prices = self.__retrieve_prices_from_fixed24h_array(
                 tgt_duration, start_time
             )
+        elif self.src == "evcc":
+            prices = self.__retrieve_prices_from_evcc(tgt_duration, start_time)
         elif self.src == "default":
             prices = self.__retrieve_prices_from_akkudoktor(tgt_duration, start_time)
         else:
@@ -1049,3 +1052,150 @@ class PriceInterface:
             extended_prices = extended_prices_15min
         self.current_prices_direct = extended_prices.copy()
         return extended_prices
+
+    def __retrieve_prices_from_evcc(self, tgt_duration, start_time=None):
+        """
+        Retrieve prices from an EVCC instance using the /tariff/grid endpoint.
+
+        Configuration expectations:
+        - `price.source: evcc`
+        - `price.token`: either the EVCC base URL (e.g. `http://evcc:7070`) or an optional bearer token.
+          If `price.token` is not an URL, the code will look for environment variable `EVCC_URL`
+          and fall back to `http://evcc:7070`.
+
+        The method performs a best-effort parse of the returned JSON and converts values
+        to €/Wh (the internal format used in this module). It supports hourly and
+        15-min timeframes and will expand/extend the returned array to `tgt_duration` slots.
+        """
+        logger.debug("[PRICE-IF] Fetching prices from EVCC ...")
+
+        # Determine base URL and auth header
+        base_url = None
+        headers = {}
+        token = self.access_token or ""
+        if token.startswith("http://") or token.startswith("https://"):
+            base_url = token.rstrip("/")
+        else:
+            base_url = os.environ.get("EVCC_URL", "http://evcc:7070").rstrip("/")
+            if token:
+                # allow user to specify either 'Bearer <token>' or raw token
+                if token.lower().startswith("bearer "):
+                    headers["Authorization"] = token
+                else:
+                    headers["Authorization"] = "Bearer " + token
+
+        endpoints = ["/tariff/grid", "/api/tariff/grid", "/api/v1/tariff/grid"]
+        data = None
+        for ep in endpoints:
+            url = base_url + ep
+            try:
+                resp = requests.get(url, headers=headers, timeout=10)
+                # Use raise_for_status() to behave like other retrieval functions
+                resp.raise_for_status()
+                data = resp.json()
+                logger.debug("[PRICE-IF] EVCC response from %s parsed", url)
+                break
+            except requests.exceptions.RequestException as e:
+                logger.debug("[PRICE-IF] EVCC request to %s failed: %s", url, e)
+                continue
+
+        if data is None:
+            logger.error("[PRICE-IF] Failed to fetch prices from EVCC at %s", base_url)
+            return []
+
+        # Helper: recursively find a numeric list in the JSON payload
+        def _extract_numeric_list(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, list):
+                # list of raw numbers?
+                if all(isinstance(x, (int, float)) for x in obj):
+                    return [float(x) for x in obj]
+                # list of objects: try common keys
+                if all(isinstance(x, dict) for x in obj):
+                    # common candidate keys
+                    for key in ("price", "value", "cost", "amount", "energy", "priceCents", "marketpriceEurocentPerKWh"):
+                        vals = []
+                        ok = True
+                        for item in obj:
+                            if key in item and isinstance(item[key], (int, float)):
+                                vals.append(float(item[key]))
+                            else:
+                                ok = False
+                                break
+                        if ok and vals:
+                            return vals
+                    # fallback: take first numeric field found in each dict
+                    vals = []
+                    for item in obj:
+                        found = False
+                        for v in item.values():
+                            if isinstance(v, (int, float)):
+                                vals.append(float(v))
+                                found = True
+                                break
+                        if not found:
+                            return None
+                    if vals:
+                        return vals
+                return None
+            if isinstance(obj, dict):
+                # try various container keys
+                for key in ("prices", "tariffs", "data", "result", "values", "items", "points"):
+                    if key in obj:
+                        res = _extract_numeric_list(obj[key])
+                        if res:
+                            return res
+                # recursive dive
+                for v in obj.values():
+                    res = _extract_numeric_list(v)
+                    if res:
+                        return res
+            return None
+
+        raw = _extract_numeric_list(data)
+        if not raw:
+            logger.error("[PRICE-IF] Did not find numeric price array in EVCC response")
+            return []
+
+        # Convert values to internal €/Wh representation using heuristics
+        mean_val = sum(abs(x) for x in raw) / max(1, len(raw))
+        if mean_val > 1.0:
+            # Likely ct/kWh -> convert: ct/kWh to €/Wh == value / 100000
+            prices_converted = [round(x / 100000, 9) for x in raw]
+        elif mean_val > 0.001:
+            # Likely €/kWh -> convert to €/Wh by dividing by 1000
+            prices_converted = [round(x / 1000, 9) for x in raw]
+        else:
+            # Already probably in €/Wh
+            prices_converted = [round(float(x), 9) for x in raw]
+
+        # Determine expected slot count (hours vs quarter-hour slots)
+        slots_per_hour = 3600 // self.time_frame_base
+        expected_slots = tgt_duration * slots_per_hour
+
+        # Start with hourly-converted values
+        extended = prices_converted.copy()
+        # for 15 min output expand each hourly value into 4 quarter-hour slots
+        if slots_per_hour > 1:
+            expanded = []
+            for p in extended:
+                expanded.extend([p] * slots_per_hour)
+            extended = expanded
+
+        # If not long enough, repeat values until we reach expected_slots
+        if len(extended) < expected_slots:
+            needed = expected_slots - len(extended)
+            i = 0
+            while needed > 0 and len(extended) < expected_slots:
+                extended.append(extended[i % len(extended)])
+                i += 1
+                needed -= 1
+
+        self.current_prices_direct = extended.copy()
+        logger.debug(
+            "[PRICE-IF] EVCC prices parsed; produced %d slots (expected %d)",
+            len(self.current_prices_direct),
+            expected_slots,
+        )
+        return extended[:expected_slots]
